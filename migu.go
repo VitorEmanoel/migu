@@ -28,12 +28,19 @@ const (
 var (
 	void            = struct{}{}
 	nullableTypeMap = map[string]struct{}{
-		"sql.NullString":  void,
-		"sql.NullBool":    void,
-		"sql.NullInt64":   void,
-		"sql.NullFloat64": void,
-		"mysql.NullTime":  void,
-		"gorp.NullTime":   void,
+		"sql.NullString":      void,
+		"sql.NullBool":        void,
+		"sql.NullInt64":       void,
+		"sql.NullFloat64":     void,
+		"mysql.NullTime":      void,
+		"gorp.NullTime":       void,
+		"spanner.NullString":  void,
+		"spanner.NullFloat64": void,
+		"spanner.NullBool":    void,
+		"spanner.NullInt64":   void,
+		"spanner.NullTime":    void,
+		"spanner.NullDate":    void,
+		"spanner.NullNumeric": void,
 	}
 )
 
@@ -143,11 +150,11 @@ func Diff(d dialect.Dialect, filename string, src interface{}) ([]string, error)
 			for _, f := range fields {
 				switch {
 				case f.IsAdded():
-					migrations = append(migrations, d.AddColumnSQL(f.new.ToField()))
+					migrations = append(migrations, d.AddColumnSQL(f.new.ToField())...)
 				case f.IsDropped():
-					migrations = append(migrations, d.DropColumnSQL(f.old.ToField()))
+					migrations = append(migrations, d.DropColumnSQL(f.old.ToField())...)
 				case f.IsModified():
-					migrations = append(migrations, d.ModifyColumnSQL(f.old.ToField(), f.new.ToField()))
+					migrations = append(migrations, d.ModifyColumnSQL(f.old.ToField(), f.new.ToField())...)
 				}
 			}
 			if d, ok := d.(dialect.PrimaryKeyModifier); ok {
@@ -179,24 +186,23 @@ func Diff(d dialect.Dialect, filename string, src interface{}) ([]string, error)
 			for i, pk := range newPks {
 				pkColumns[i] = pk.ToField().Name
 			}
-			query := d.CreateTableSQL(dialect.Table{
+			migrations = append(migrations, d.CreateTableSQL(dialect.Table{
 				Name:        name,
 				Fields:      fields,
 				PrimaryKeys: pkColumns,
 				Option:      tbl.Option,
-			})
-			migrations = append(migrations, query)
+			})...)
 		}
 		addIndexes, dropIndexes := makeIndexes(oldFields, tbl.Fields)
 		for _, index := range dropIndexes {
 			// If the column which has the index will be deleted, Migu will not delete the index related to the column
 			// because the index will be deleted when the column which related to the index will be deleted.
 			if _, ok := droppedColumn[index.Columns[0]]; !ok {
-				migrations = append(migrations, d.DropIndexSQL(index.ToIndex()))
+				migrations = append(migrations, d.DropIndexSQL(index.ToIndex())...)
 			}
 		}
 		for _, index := range addIndexes {
-			migrations = append(migrations, d.CreateIndexSQL(index.ToIndex()))
+			migrations = append(migrations, d.CreateIndexSQL(index.ToIndex())...)
 		}
 		delete(structMap, name)
 		delete(tableMap, name)
@@ -534,13 +540,22 @@ func Fprint(output io.Writer, d dialect.Dialect) error {
 	if err != nil {
 		return err
 	}
+	pkgMap := map[string]struct{}{}
 	for _, schemas := range tableMap {
 		for _, schema := range schemas {
 			if pkg := d.ImportPackage(schema); pkg != "" {
-				if err := fprintln(output, importAST(pkg)); err != nil {
-					return err
-				}
+				pkgMap[pkg] = struct{}{}
 			}
+		}
+	}
+	if len(pkgMap) != 0 {
+		pkgs := make([]string, 0, len(pkgMap))
+		for pkg := range pkgMap {
+			pkgs = append(pkgs, pkg)
+		}
+		sort.Strings(pkgs)
+		if err := fprintln(output, importAST(pkgs)); err != nil {
+			return err
 		}
 	}
 	names := make([]string, 0, len(tableMap))
@@ -670,18 +685,19 @@ func detectTypeName(n ast.Node) (string, error) {
 	}
 }
 
-func importAST(pkg string) ast.Decl {
-	return &ast.GenDecl{
+func importAST(pkgs []string) ast.Decl {
+	decl := &ast.GenDecl{
 		Tok: token.IMPORT,
-		Specs: []ast.Spec{
-			&ast.ImportSpec{
-				Path: &ast.BasicLit{
-					Kind:  token.STRING,
-					Value: fmt.Sprintf(`"%s"`, pkg),
-				},
-			},
-		},
 	}
+	for _, pkg := range pkgs {
+		decl.Specs = append(decl.Specs, &ast.ImportSpec{
+			Path: &ast.BasicLit{
+				Kind:  token.STRING,
+				Value: fmt.Sprintf(`"%s"`, pkg),
+			},
+		})
+	}
+	return decl
 }
 
 func makeStructAST(d dialect.Dialect, name string, schemas []dialect.ColumnSchema) (ast.Decl, error) {

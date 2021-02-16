@@ -1,4 +1,4 @@
-# Migu [![Build Status](https://travis-ci.org/naoina/migu.svg?branch=master)](https://travis-ci.org/naoina/migu)
+# Migu [![build-and-test](https://github.com/naoina/migu/workflows/build-and-test/badge.svg)](https://github.com/naoina/migu/actions?query=workflow%3Abuild-and-test)
 
 Migu is an idempotent database schema migration tool for [Go](http://golang.org).
 
@@ -192,6 +192,20 @@ CREATE TABLE `user` (
 )
 ```
 
+For Cloud Spanner,
+
+```go
+ID int64 `migu:"pk"` // Every table of Cloud Spanner must have a primary key.
+UpdatedAt time.Time `migu:"extra:allow_commit_timestamp = true"`
+```
+
+```sql
+CREATE TABLE `user` (
+  `id` INT64 NOT NULL,
+  `updated_at` TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp = true)
+) PRIMARY KEY (`id`)
+```
+
 #### IGNORE
 
 ```go
@@ -340,6 +354,7 @@ CREATE TABLE `user` (
 ## Supported database
 
 * MariaDB/MySQL
+* Cloud Spanner
 
 ## FAQ
 
