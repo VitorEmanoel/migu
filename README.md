@@ -1,4 +1,4 @@
-# Migu [![Build Status](https://travis-ci.org/naoina/migu.svg?branch=master)](https://travis-ci.org/naoina/migu)
+# Migu [![build-and-test](https://github.com/naoina/migu/workflows/build-and-test/badge.svg)](https://github.com/naoina/migu/actions?query=workflow%3Abuild-and-test) [![Go Reference](https://pkg.go.dev/badge/github.com/naoina/migu.svg)](https://pkg.go.dev/github.com/naoina/migu)
 
 Migu is an idempotent database schema migration tool for [Go](http://golang.org).
 
@@ -145,12 +145,6 @@ If a field type is string, Migu surrounds a string value by dialect-specific quo
 Active string `migu:"default:yes"`
 ```
 
-#### SIZE
-
-```go
-Body string `migu:"size:512"` // VARCHAR(512)
-```
-
 #### COLUMN
 
 You can specify the column name on the database.
@@ -167,36 +161,19 @@ To specify the type of column, please use `type` struct tag.
 Balance float64 `migu:"type:decimal"`
 ```
 
+You can also use `type` struct tag to specify the different size of `VARCHAR`, `VARBINARY`, `DECIMAL` and so on.
+
+```go
+Balance float64 `migu:"type:decimal(20,2)"`
+UUID    string  `migu:"type:varchar(36)"`
+```
+
 #### NULL
 
 By default, A user-defined type will be `NOT NULL`. If you don't want to specify `NOT NULL`, you can use `null` struct tag like below.
 
 ```go
 Amount CustomType `migu:"type:int,null"`
-```
-
-#### PRECISION & SCALE
-
-If `DECIMAL` data type is specified, `precision` and `scale` tags can be used.
-
-```go
-Balance float64 `migu:"type:decimal,precision:65,scale:2"`
-```
-
-This will become the following data type.
-
-```sql
-DECIMAL(65,2)
-```
-
-Also `precision` tag can be used for the date and time types.
-
-```go
-CreatedAt time.Time `migu:"precision:6"`
-```
-
-```sql
-DATETIME(6)
 ```
 
 #### EXTRA
@@ -213,6 +190,20 @@ The clause specified by `extra` field tag will be added to trailing the column d
 CREATE TABLE `user` (
   `updated_at` DATETIME NOT NULL ON UPDATE CURRENT_TIMESTAMP
 )
+```
+
+For Cloud Spanner,
+
+```go
+ID int64 `migu:"pk"` // Every table of Cloud Spanner must have a primary key.
+UpdatedAt time.Time `migu:"extra:allow_commit_timestamp = true"`
+```
+
+```sql
+CREATE TABLE `user` (
+  `id` INT64 NOT NULL,
+  `updated_at` TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp = true)
+) PRIMARY KEY (`id`)
 ```
 
 #### IGNORE
@@ -363,6 +354,7 @@ CREATE TABLE `user` (
 ## Supported database
 
 * MariaDB/MySQL
+* Cloud Spanner
 
 ## FAQ
 

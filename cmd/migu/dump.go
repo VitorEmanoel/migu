@@ -1,52 +1,65 @@
 package main
 
 import (
-	"database/sql"
 	"fmt"
 	"os"
+	"path"
 
 	"github.com/naoina/migu"
+	"github.com/naoina/migu/dialect"
+	"github.com/spf13/cobra"
 )
 
-type dump struct {
-	GeneralOption
+func init() {
+	dump := &dump{}
+	dumpCmd := &cobra.Command{
+		Use:   "dump [OPTIONS] DATABASE [FILE]",
+		Short: "dump the database schema as Go code",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return dump.Execute(args, option)
+		},
+	}
+	dumpCmd.SetUsageTemplate(usageTemplate + "\nWith FILE, output to FILE.\n")
+	rootCmd.AddCommand(dumpCmd)
 }
 
-func (d *dump) Usage() string {
-	return fmt.Sprintf(`Usage: %s dump [OPTIONS] DATABASE [FILE]
+type dump struct{}
 
-Options:
-%s
-With FILE, output to FILE.
-`, progName, d.GeneralOption.Usage())
-}
-
-func (d *dump) Execute(args []string) error {
+func (d *dump) Execute(args []string, opt *Option) error {
 	var dbname string
 	var filename string
 	switch len(args) {
 	case 0:
-		return &usageError{
-			err: fmt.Errorf("too few arguments"),
-		}
+		return fmt.Errorf("too few arguments")
 	case 1:
 		dbname = args[0]
 	case 2:
 		dbname, filename = args[0], args[1]
 	default:
-		return &usageError{
-			err: fmt.Errorf("too many arguments"),
+		return fmt.Errorf("too many arguments")
+	}
+	var opts []dialect.Option
+	if columnTypes := opt.global.ColumnTypes; len(columnTypes) != 0 {
+		opts = append(opts, dialect.WithColumnType(columnTypes))
+	}
+	var di dialect.Dialect
+	switch typ := opt.global.DatabaseType; typ {
+	case databaseTypeMySQL, databaseTypeMariaDB:
+		db, err := openDatabase(dbname)
+		if err != nil {
+			return err
 		}
+		defer db.Close()
+		di = dialect.NewMySQL(db, opts...)
+	case databaseTypeSpanner:
+		di = dialect.NewSpanner(path.Join("projects", opt.spanner.Project, "instances", opt.spanner.Instance, "databases", dbname), opts...)
+	default:
+		return fmt.Errorf("BUG: unknown database type: %s", typ)
 	}
-	db, err := database(dbname, d.GeneralOption)
-	if err != nil {
-		return err
-	}
-	defer db.Close()
-	return d.run(db, filename)
+	return d.run(di, filename)
 }
 
-func (d *dump) run(db *sql.DB, filename string) error {
+func (d *dump) run(di dialect.Dialect, filename string) error {
 	out := os.Stdout
 	if filename != "" {
 		file, err := os.Create(filename)
@@ -56,5 +69,5 @@ func (d *dump) run(db *sql.DB, filename string) error {
 		defer file.Close()
 		out = file
 	}
-	return migu.Fprint(out, db)
+	return migu.Fprint(out, di)
 }

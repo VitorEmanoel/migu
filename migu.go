@@ -1,7 +1,7 @@
 package migu
 
 import (
-	"database/sql"
+	"bufio"
 	"fmt"
 	"go/ast"
 	"go/format"
@@ -23,7 +23,6 @@ const (
 	commentPrefix       = "//"
 	marker              = "+migu"
 	annotationSeparator = ':'
-	defaultVarcharSize  = 255
 )
 
 // Sync synchronizes the schema between Go's struct and the database.
@@ -37,17 +36,17 @@ const (
 // All query for synchronization will be performed within the transaction if
 // storage engine supports the transaction. (e.g. MySQL's MyISAM engine does
 // NOT support the transaction)
-func Sync(db *sql.DB, filename string, src interface{}) error {
-	sqls, err := Diff(db, filename, src)
+func Sync(d dialect.Dialect, filename string, src interface{}) error {
+	sqls, err := Diff(d, filename, src)
 	if err != nil {
 		return err
 	}
-	tx, err := db.Begin()
+	tx, err := d.Begin()
 	if err != nil {
 		return err
 	}
 	for _, sql := range sqls {
-		if _, err := tx.Exec(sql); err != nil {
+		if err := tx.Exec(sql); err != nil {
 			tx.Rollback()
 			return err
 		}
@@ -56,7 +55,7 @@ func Sync(db *sql.DB, filename string, src interface{}) error {
 }
 
 // Diff returns SQLs for schema synchronous between database and Go's struct.
-func Diff(db *sql.DB, filename string, src interface{}) ([]string, error) {
+func Diff(d dialect.Dialect, filename string, src interface{}) ([]string, error) {
 	var filenames []string
 	structASTMap := make(map[string]*structAST)
 	if src == nil {
@@ -77,7 +76,6 @@ func Diff(db *sql.DB, filename string, src interface{}) ([]string, error) {
 			structASTMap[k] = v
 		}
 	}
-	d := dialect.NewMySQL(db)
 	structMap := map[string]*table{}
 	for name, structAST := range structASTMap {
 		for _, fld := range structAST.StructType.Fields.List {
@@ -85,7 +83,7 @@ func Diff(db *sql.DB, filename string, src interface{}) ([]string, error) {
 			if err != nil {
 				return nil, err
 			}
-			f, err := newField(d, typeName, fld)
+			f, err := newField(d, name, typeName, fld)
 			if err != nil {
 				return nil, err
 			}
@@ -116,43 +114,43 @@ func Diff(db *sql.DB, filename string, src interface{}) ([]string, error) {
 	droppedColumn := map[string]struct{}{}
 	for _, name := range names {
 		tbl := structMap[name]
-		tableName := d.Quote(name)
 		var oldFields []*field
 		if columns, ok := tableMap[name]; ok {
 			for _, c := range columns {
-				oldFieldAST, err := fieldAST(c)
+				oldFieldAST, err := fieldAST(d, c)
 				if err != nil {
 					return nil, err
 				}
-				f, err := newField(d, fmt.Sprint(oldFieldAST.Type), oldFieldAST)
+				f, err := newField(d, name, fmt.Sprint(oldFieldAST.Type), oldFieldAST)
 				if err != nil {
 					return nil, err
 				}
 				oldFields = append(oldFields, f)
 			}
 			fields := makeAlterTableFields(oldFields, tbl.Fields)
-			specs := make([]string, 0, len(fields))
 			for _, f := range fields {
 				switch {
 				case f.IsAdded():
-					specs = append(specs, fmt.Sprintf("ADD %s", columnSQL(d, f.new)))
+					migrations = append(migrations, d.AddColumnSQL(f.new.ToField())...)
 				case f.IsDropped():
-					specs = append(specs, fmt.Sprintf("DROP %s", d.Quote(f.old.Column)))
+					migrations = append(migrations, d.DropColumnSQL(f.old.ToField())...)
 				case f.IsModified():
-					specs = append(specs, fmt.Sprintf("CHANGE %s %s", d.Quote(f.old.Column), columnSQL(d, f.new)))
+					migrations = append(migrations, d.ModifyColumnSQL(f.old.ToField(), f.new.ToField())...)
 				}
 			}
-			if pkColumns, changed := makePrimaryKeyColumns(oldFields, tbl.Fields); len(pkColumns) > 0 {
-				if changed {
-					specs = append(specs, "DROP PRIMARY KEY")
+			if d, ok := d.(dialect.PrimaryKeyModifier); ok {
+				oldPks, newPks := makePrimaryKeyColumns(oldFields, tbl.Fields)
+				if len(oldPks) > 0 || len(newPks) > 0 {
+					oldPrimaryKeyFields := make([]dialect.Field, len(oldPks))
+					for i, pk := range oldPks {
+						oldPrimaryKeyFields[i] = pk.ToField()
+					}
+					newPrimaryKeyFields := make([]dialect.Field, len(newPks))
+					for i, pk := range newPks {
+						newPrimaryKeyFields[i] = pk.ToField()
+					}
+					migrations = append(migrations, d.ModifyPrimaryKeySQL(oldPrimaryKeyFields, newPrimaryKeyFields)...)
 				}
-				for i, c := range pkColumns {
-					pkColumns[i] = d.Quote(c)
-				}
-				specs = append(specs, fmt.Sprintf("ADD PRIMARY KEY (%s)", strings.Join(pkColumns, ", ")))
-			}
-			if len(specs) > 0 {
-				migrations = append(migrations, fmt.Sprintf("ALTER TABLE %s %s", tableName, strings.Join(specs, ", ")))
 			}
 			for _, f := range fields {
 				if f.IsDropped() {
@@ -160,42 +158,32 @@ func Diff(db *sql.DB, filename string, src interface{}) ([]string, error) {
 				}
 			}
 		} else {
-			columns := make([]string, len(tbl.Fields))
+			fields := make([]dialect.Field, len(tbl.Fields))
 			for i, f := range tbl.Fields {
-				columns[i] = columnSQL(d, f)
+				fields[i] = f.ToField()
 			}
-			if pkColumns, _ := makePrimaryKeyColumns(oldFields, tbl.Fields); len(pkColumns) > 0 {
-				for i, c := range pkColumns {
-					pkColumns[i] = d.Quote(c)
-				}
-				columns = append(columns, fmt.Sprintf("PRIMARY KEY (%s)", strings.Join(pkColumns, ", ")))
+			_, newPks := makePrimaryKeyColumns(oldFields, tbl.Fields)
+			pkColumns := make([]string, len(newPks))
+			for i, pk := range newPks {
+				pkColumns[i] = pk.ToField().Name
 			}
-			query := fmt.Sprintf("CREATE TABLE %s (\n"+
-				"  %s\n"+
-				")", tableName, strings.Join(columns, ",\n  "))
-			if tbl.Option != "" {
-				query += " " + tbl.Option
-			}
-			migrations = append(migrations, query)
+			migrations = append(migrations, d.CreateTableSQL(dialect.Table{
+				Name:        name,
+				Fields:      fields,
+				PrimaryKeys: pkColumns,
+				Option:      tbl.Option,
+			})...)
 		}
 		addIndexes, dropIndexes := makeIndexes(oldFields, tbl.Fields)
 		for _, index := range dropIndexes {
 			// If the column which has the index will be deleted, Migu will not delete the index related to the column
 			// because the index will be deleted when the column which related to the index will be deleted.
 			if _, ok := droppedColumn[index.Columns[0]]; !ok {
-				migrations = append(migrations, fmt.Sprintf("DROP INDEX %s ON %s", d.Quote(index.Name), tableName))
+				migrations = append(migrations, d.DropIndexSQL(index.ToIndex())...)
 			}
 		}
 		for _, index := range addIndexes {
-			columns := make([]string, 0, len(index.Columns))
-			for _, c := range index.Columns {
-				columns = append(columns, d.Quote(c))
-			}
-			if index.Unique {
-				migrations = append(migrations, fmt.Sprintf("CREATE UNIQUE INDEX %s ON %s (%s)", d.Quote(index.Name), tableName, strings.Join(columns, ",")))
-			} else {
-				migrations = append(migrations, fmt.Sprintf("CREATE INDEX %s ON %s (%s)", d.Quote(index.Name), tableName, strings.Join(columns, ",")))
-			}
+			migrations = append(migrations, d.CreateIndexSQL(index.ToIndex())...)
 		}
 		delete(structMap, name)
 		delete(tableMap, name)
@@ -243,12 +231,23 @@ type table struct {
 }
 
 type index struct {
+	Table   string
 	Name    string
 	Columns []string
 	Unique  bool
 }
 
+func (i *index) ToIndex() dialect.Index {
+	return dialect.Index{
+		Table:   i.Table,
+		Name:    i.Name,
+		Columns: i.Columns,
+		Unique:  i.Unique,
+	}
+}
+
 type field struct {
+	Table         string
 	Name          string
 	GoType        string
 	Type          string
@@ -260,18 +259,14 @@ type field struct {
 	AutoIncrement bool
 	Ignore        bool
 	Default       string
-	Size          uint64
 	Extra         string
 	Nullable      bool
-	Unsigned      bool
-	Precision     int64
-	Scale         int64
 }
 
-func newField(d dialect.Dialect, typeName string, f *ast.Field) (*field, error) {
+func newField(d dialect.Dialect, tableName string, typeName string, f *ast.Field) (*field, error) {
 	ret := &field{
+		Table:  tableName,
 		GoType: typeName,
-		Size:   defaultVarcharSize,
 	}
 	if len(f.Names) > 0 && f.Names[0] != nil {
 		ret.Name = f.Names[0].Name
@@ -294,20 +289,20 @@ func newField(d dialect.Dialect, typeName string, f *ast.Field) (*field, error) 
 	if ret.Column == "" {
 		ret.Column = stringutil.ToSnakeCase(ret.Name)
 	}
-	colType, unsigned, null := d.ColumnType(ret.GoType, ret.Size, ret.AutoIncrement)
-	if ret.Type != "" {
+	if !ret.Nullable {
+		if ret.GoType[0] == '*' {
+			ret.Nullable = true
+		} else {
+			ret.Nullable = d.IsNullable(strings.TrimLeft(ret.GoType, "*"))
+		}
+	}
+	var colType string
+	if ret.Type == "" {
+		colType = strings.TrimLeft(ret.GoType, "*")
+	} else {
 		colType = ret.Type
 	}
-	if colType == "" {
-		return nil, fmt.Errorf("unsupported Go data type `%s'. You can use `type' struct tag if you use a user-defined type. See https://github.com/naoina/migu#type", ret.GoType)
-	}
-	ret.Unsigned = unsigned
-	if !ret.Nullable {
-		ret.Nullable = null
-	}
-	if ret.Type = d.DataType(colType, ret.Size, ret.Unsigned, ret.Precision, ret.Scale); ret.Type == "" {
-		return nil, fmt.Errorf("unknown data type: `%s'", colType)
-	}
+	ret.Type = d.ColumnType(colType)
 	return ret, nil
 }
 
@@ -315,7 +310,7 @@ func (f *field) Indexes() []string {
 	indexes := make([]string, 0, len(f.RawIndexes))
 	for _, index := range f.RawIndexes {
 		if index == "" {
-			index = f.Column
+			index = stringutil.ToSnakeCase(f.Table) + "_" + f.Column
 		}
 		indexes = append(indexes, index)
 	}
@@ -326,7 +321,7 @@ func (f *field) UniqueIndexes() []string {
 	uniques := make([]string, 0, len(f.RawUniques))
 	for _, u := range f.RawUniques {
 		if u == "" {
-			u = f.Column
+			u = stringutil.ToSnakeCase(f.Table) + "_" + f.Column
 		}
 		uniques = append(uniques, u)
 	}
@@ -351,30 +346,43 @@ func (f *field) IsEmbedded() bool {
 	return f.Name == ""
 }
 
-func makePrimaryKeyColumns(oldFields, newFields []*field) (pkColumns []string, changed bool) {
+func (f *field) ToField() dialect.Field {
+	return dialect.Field{
+		Table:         f.Table,
+		Name:          f.Column,
+		Type:          f.Type,
+		Comment:       f.Comment,
+		AutoIncrement: f.AutoIncrement,
+		Default:       f.Default,
+		Extra:         f.Extra,
+		Nullable:      f.Nullable,
+	}
+}
+
+func makePrimaryKeyColumns(oldFields, newFields []*field) (oldPks, newPks []*field) {
 	for _, f := range newFields {
 		if f.PrimaryKey {
-			pkColumns = append(pkColumns, f.Column)
+			newPks = append(newPks, f)
 		}
 	}
-	m := map[string]struct{}{}
 	for _, f := range oldFields {
 		if f.PrimaryKey {
-			m[f.Column] = struct{}{}
+			oldPks = append(oldPks, f)
 		}
 	}
-	if len(m) != len(pkColumns) {
-		if len(m) == 0 {
-			return pkColumns, false
-		}
-		return pkColumns, true
+	if len(oldPks) != len(newPks) {
+		return oldPks, newPks
 	}
-	for _, pk := range pkColumns {
-		if _, exists := m[pk]; !exists {
-			return pkColumns, true
+	m := make(map[string]struct{}, len(oldPks))
+	for _, f := range oldPks {
+		m[f.Column] = struct{}{}
+	}
+	for _, pk := range newPks {
+		if _, exists := m[pk.Column]; !exists {
+			return oldPks, newPks
 		}
 	}
-	return nil, false
+	return nil, nil
 }
 
 func makeIndexes(oldFields, newFields []*field) (addIndexes, dropIndexes []*index) {
@@ -396,7 +404,11 @@ func makeIndexes(oldFields, newFields []*field) (addIndexes, dropIndexes []*inde
 		for _, name := range oindexes {
 			if !inStrings(nindexes, name) {
 				if dropIndexMap[name] == nil {
-					dropIndexMap[name] = &index{Name: name, Unique: false}
+					dropIndexMap[name] = &index{
+						Table:  f.Table,
+						Name:   name,
+						Unique: false,
+					}
 					dropIndexNames = append(dropIndexNames, name)
 				}
 				dropIndexMap[name].Columns = append(dropIndexMap[name].Columns, oldField.Column)
@@ -405,7 +417,11 @@ func makeIndexes(oldFields, newFields []*field) (addIndexes, dropIndexes []*inde
 		for _, name := range oldUniqueIndexes {
 			if !inStrings(newUniqueIndexes, name) {
 				if dropIndexMap[name] == nil {
-					dropIndexMap[name] = &index{Name: name, Unique: true}
+					dropIndexMap[name] = &index{
+						Table:  f.Table,
+						Name:   name,
+						Unique: true,
+					}
 					dropIndexNames = append(dropIndexNames, name)
 				}
 				dropIndexMap[name].Columns = append(dropIndexMap[name].Columns, oldField.Column)
@@ -414,7 +430,11 @@ func makeIndexes(oldFields, newFields []*field) (addIndexes, dropIndexes []*inde
 		for _, name := range nindexes {
 			if !inStrings(oindexes, name) {
 				if addIndexMap[name] == nil {
-					addIndexMap[name] = &index{Name: name, Unique: false}
+					addIndexMap[name] = &index{
+						Table:  f.Table,
+						Name:   name,
+						Unique: false,
+					}
 					addIndexNames = append(addIndexNames, name)
 				}
 				addIndexMap[name].Columns = append(addIndexMap[name].Columns, f.Column)
@@ -423,7 +443,11 @@ func makeIndexes(oldFields, newFields []*field) (addIndexes, dropIndexes []*inde
 		for _, name := range newUniqueIndexes {
 			if !inStrings(oldUniqueIndexes, name) {
 				if addIndexMap[name] == nil {
-					addIndexMap[name] = &index{Name: name, Unique: true}
+					addIndexMap[name] = &index{
+						Table:  f.Table,
+						Name:   name,
+						Unique: true,
+					}
 					addIndexNames = append(addIndexNames, name)
 				}
 				addIndexMap[name].Columns = append(addIndexMap[name].Columns, f.Column)
@@ -491,14 +515,26 @@ func makeAlterTableFields(oldFields, newFields []*field) (fields []modifiedField
 }
 
 // Fprint generates Go's structs from database schema and writes to output.
-func Fprint(output io.Writer, db *sql.DB) error {
-	d := dialect.NewMySQL(db)
+func Fprint(output io.Writer, d dialect.Dialect) error {
 	tableMap, err := getTableMap(d)
 	if err != nil {
 		return err
 	}
-	if hasDatetimeColumn(tableMap) {
-		if err := fprintln(output, importAST("time")); err != nil {
+	pkgMap := map[string]struct{}{}
+	for _, schemas := range tableMap {
+		for _, schema := range schemas {
+			if pkg := d.ImportPackage(schema); pkg != "" {
+				pkgMap[pkg] = struct{}{}
+			}
+		}
+	}
+	if len(pkgMap) != 0 {
+		pkgs := make([]string, 0, len(pkgMap))
+		for pkg := range pkgMap {
+			pkgs = append(pkgs, pkg)
+		}
+		sort.Strings(pkgs)
+		if err := fprintln(output, importAST(pkgs)); err != nil {
 			return err
 		}
 	}
@@ -526,13 +562,10 @@ const (
 	tagAutoIncrement = "autoincrement"
 	tagIndex         = "index"
 	tagUnique        = "unique"
-	tagSize          = "size"
 	tagColumn        = "column"
 	tagType          = "type"
 	tagNull          = "null"
 	tagExtra         = "extra"
-	tagPrecision     = "precision"
-	tagScale         = "scale"
 	tagIgnore        = "-"
 )
 
@@ -546,15 +579,6 @@ func getTableMap(d dialect.Dialect, tables ...string) (map[string][]dialect.Colu
 		tableMap[s.TableName()] = append(tableMap[s.TableName()], s)
 	}
 	return tableMap, nil
-}
-
-func formatDefault(d dialect.Dialect, t, def string) string {
-	switch t {
-	case "string":
-		return d.QuoteString(def)
-	default:
-		return def
-	}
 }
 
 func fprintln(output io.Writer, decl ast.Decl) error {
@@ -641,55 +665,25 @@ func detectTypeName(n ast.Node) (string, error) {
 	}
 }
 
-func columnSQL(d dialect.Dialect, f *field) string {
-	column := []string{d.Quote(f.Column), f.Type}
-	if !f.Nullable {
-		column = append(column, "NOT NULL")
-	}
-	if f.Default != "" {
-		column = append(column, "DEFAULT", formatDefault(d, f.GoType, f.Default))
-	}
-	if f.AutoIncrement && d.AutoIncrement() != "" {
-		column = append(column, d.AutoIncrement())
-	}
-	if f.Extra != "" {
-		column = append(column, f.Extra)
-	}
-	if f.Comment != "" {
-		column = append(column, "COMMENT", d.QuoteString(f.Comment))
-	}
-	return strings.Join(column, " ")
-}
-
-func hasDatetimeColumn(t map[string][]dialect.ColumnSchema) bool {
-	for _, schemas := range t {
-		for _, schema := range schemas {
-			if schema.IsDatetime() {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func importAST(pkg string) ast.Decl {
-	return &ast.GenDecl{
+func importAST(pkgs []string) ast.Decl {
+	decl := &ast.GenDecl{
 		Tok: token.IMPORT,
-		Specs: []ast.Spec{
-			&ast.ImportSpec{
-				Path: &ast.BasicLit{
-					Kind:  token.STRING,
-					Value: fmt.Sprintf(`"%s"`, pkg),
-				},
-			},
-		},
 	}
+	for _, pkg := range pkgs {
+		decl.Specs = append(decl.Specs, &ast.ImportSpec{
+			Path: &ast.BasicLit{
+				Kind:  token.STRING,
+				Value: fmt.Sprintf(`"%s"`, pkg),
+			},
+		})
+	}
+	return decl
 }
 
 func makeStructAST(d dialect.Dialect, name string, schemas []dialect.ColumnSchema) (ast.Decl, error) {
 	var fields []*ast.Field
 	for _, schema := range schemas {
-		f, err := fieldAST(schema)
+		f, err := fieldAST(d, schema)
 		if err != nil {
 			return nil, err
 		}
@@ -715,7 +709,10 @@ func parseStructTag(d dialect.Dialect, f *field, tag reflect.StructTag) error {
 	if migu == "" {
 		return nil
 	}
-	for _, opt := range strings.Split(migu, ",") {
+	scanner := bufio.NewScanner(strings.NewReader(migu))
+	scanner.Split(tagOptionSplit)
+	for scanner.Scan() {
+		opt := scanner.Text()
 		optval := strings.SplitN(opt, ":", 2)
 		switch optval[0] {
 		case tagDefault:
@@ -752,54 +749,44 @@ func parseStructTag(d dialect.Dialect, f *field, tag reflect.StructTag) error {
 			f.Type = optval[1]
 		case tagNull:
 			f.Nullable = true
-		case tagSize:
-			if len(optval) < 2 {
-				return fmt.Errorf("`size' tag must specify the parameter")
-			}
-			size, err := strconv.ParseUint(optval[1], 10, 64)
-			if err != nil {
-				return err
-			}
-			f.Size = size
 		case tagExtra:
 			if len(optval) < 2 {
 				return fmt.Errorf("`extra` tag must specify the parameter")
 			}
 			f.Extra = optval[1]
-		case tagPrecision:
-			if len(optval) < 2 {
-				return fmt.Errorf("`precision` tag must specify the parameter")
-			}
-			prec, err := strconv.ParseInt(optval[1], 10, 64)
-			if err != nil {
-				return err
-			}
-			f.Precision = prec
-		case tagScale:
-			if len(optval) < 2 {
-				return fmt.Errorf("`scale` tag must specify the parameter")
-			}
-			scale, err := strconv.ParseInt(optval[1], 10, 64)
-			if err != nil {
-				return err
-			}
-			f.Scale = scale
 		default:
 			return fmt.Errorf("unknown option: `%s'", opt)
 		}
 	}
-	return nil
+	return scanner.Err()
 }
 
-func fieldAST(schema dialect.ColumnSchema) (*ast.Field, error) {
+func tagOptionSplit(data []byte, atEOF bool) (advance int, token []byte, err error) {
+	var inParenthesis bool
+	for i := 0; i < len(data); i++ {
+		switch data[i] {
+		case ',':
+			if !inParenthesis {
+				return i + 1, data[:i], nil
+			}
+		case '(':
+			inParenthesis = true
+		case ')':
+			inParenthesis = false
+		}
+	}
+	return 0, data, bufio.ErrFinalToken
+}
+
+func fieldAST(d dialect.Dialect, schema dialect.ColumnSchema) (*ast.Field, error) {
 	field := &ast.Field{
 		Names: []*ast.Ident{
 			ast.NewIdent(stringutil.ToUpperCamelCase(schema.ColumnName())),
 		},
-		Type: ast.NewIdent(schema.GoType()),
+		Type: ast.NewIdent(d.GoType(schema.ColumnType(), schema.IsNullable())),
 	}
 	var tags []string
-	tags = append(tags, fmt.Sprintf("%s:%s", tagType, schema.DataType()))
+	tags = append(tags, fmt.Sprintf("%s:%s", tagType, schema.ColumnType()))
 	if v, ok := schema.Default(); ok {
 		tags = append(tags, tagDefault+":"+v)
 	}
@@ -821,15 +808,6 @@ func fieldAST(schema dialect.ColumnSchema) (*ast.Field, error) {
 		} else {
 			tags = append(tags, fmt.Sprintf("%s:%s", tag, v))
 		}
-	}
-	if v, ok := schema.Size(); ok {
-		tags = append(tags, fmt.Sprintf("%s:%d", tagSize, v))
-	}
-	if v, ok := schema.Precision(); ok {
-		tags = append(tags, fmt.Sprintf("%s:%d", tagPrecision, v))
-	}
-	if v, ok := schema.Scale(); ok {
-		tags = append(tags, fmt.Sprintf("%s:%d", tagScale, v))
 	}
 	if schema.IsNullable() {
 		tags = append(tags, tagNull)
